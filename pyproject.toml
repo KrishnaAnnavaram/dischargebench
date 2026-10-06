@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clinical-summarization"
+version = "0.1.0"
+description = "Reproducible benchmark for generating the Brief Hospital Course of discharge notes"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Krishna Annavaram" }]
+requires-python = ">=3.10"
+dependencies = ["pandas>=2.0", "pyyaml>=6.0"]
+
+[project.optional-dependencies]
+hf = ["torch", "transformers>=4.40", "sentencepiece"]
+eval = ["evaluate", "rouge-score", "bert-score", "nltk"]
+llm = ["requests>=2.31"]
+dev = ["pytest>=8", "ruff"]
+
+[project.scripts]
+clinsum = "clinical_summarization.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+clinical_summarization = ["prompts/*.txt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 110

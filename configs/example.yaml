@@ -1,0 +1,30 @@
+# One experiment = one config file. The whole config is saved next to the predictions of each run.
+run_name: zeroshot-bart-large
+seed: 42
+
+data:
+  notes: data/discharge.csv
+  targets: data/mimic-iv-bhc.csv
+  split: test            # train | val | test (patient-level, see data/splits.py)
+  limit: 1000            # same notes for every model
+  expand_abbreviations: false
+
+model:
+  kind: seq2seq          # seq2seq | llm
+  name: facebook/bart-large
+  max_input_tokens: 1024
+  long_input: chunk      # truncate | chunk  (chunk = map-reduce summarization)
+  generation:
+    num_beams: 4
+    max_new_tokens: 256
+
+# llm example:
+# model:
+#   kind: llm
+#   name: llama3.1:8b
+#   prompt: bhc_one_paragraph
+#   temperature: 0
+#   seed: 42
+
+eval:
+  metrics: [rouge, bleu, bertscore]
