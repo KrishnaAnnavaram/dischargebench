@@ -15,6 +15,9 @@ SPLITS = ("train", "val", "test")
 def split_of(subject_id: object, seed: int = 42, ratios: tuple[float, float, float] = (0.8, 0.1, 0.1)) -> str:
     if abs(sum(ratios) - 1.0) > 1e-9:
         raise ValueError(f"ratios must sum to 1, got {ratios}")
+    if isinstance(subject_id, float) and subject_id.is_integer():
+        # pandas reads an integer column with a blank cell as float64: 10001.0 must stay patient 10001.
+        subject_id = int(subject_id)
     digest = hashlib.sha256(f"{seed}:{subject_id}".encode()).digest()
     u = int.from_bytes(digest[:8], "big") / 2**64          # uniform in [0, 1)
     if u < ratios[0]:

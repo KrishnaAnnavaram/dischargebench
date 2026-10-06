@@ -2,7 +2,7 @@ import pandas as pd
 import pytest
 
 from clinical_summarization.data.loaders import build_pairs
-from clinical_summarization.data.splits import split_of
+from clinical_summarization.data.splits import assign_splits, split_of
 from clinical_summarization.eval.metrics import align
 
 
@@ -28,3 +28,11 @@ def test_align_refuses_mismatched_ids():
         align({"a": "x", "c": "y"}, {"a": "r1", "b": "r2"})
     ids, preds, refs = align({"b": "pb", "a": "<think>t</think>pa"}, {"a": "ra", "b": "rb"})
     assert ids == ["a", "b"] and preds == ["pa", "pb"] and refs == ["ra", "rb"]
+
+
+def test_float_subject_ids_keep_the_patient_split():
+    # A blank cell makes pandas read subject_id as float64. Patient 2 must stay in the same split.
+    assert all(split_of(i) == split_of(float(i)) for i in range(1, 200))
+    ints = assign_splits(pd.DataFrame({"subject_id": [1, 2, 7]}))
+    floats = assign_splits(pd.DataFrame({"subject_id": [1.0, 2.0, 7.0, None]}))
+    assert list(floats[:3]) == list(ints)
