@@ -40,6 +40,10 @@
 > dischargebench is in early development. Milestones M0 and M1 are complete: the project skeleton and the data tools, with tests.
 > No model has run on the benchmark yet, and this README gives no model scores. Section [11](#11-the-controls-and-the-roadmap) shows what exists and what is planned.
 
+> [!CAUTION]
+> Do not use dischargebench or its outputs for patient care. It is a research benchmark, and no clinician checked a summary that it makes.
+> Obey the PhysioNet Data Use Agreement for all MIMIC data.
+
 dischargebench prepares a fair test for BHC summarization on de-identified MIMIC-IV notes.
 A quick experiment often gives a high score for a wrong reason. For example, the input contains the reference summary, or the evaluation compares rows by position.
 dischargebench makes each of these problems a design rule, and the code enforces the rules that exist today.
