@@ -77,6 +77,7 @@ This README is the **one location that explains all of dischargebench**. It give
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one note](#42-the-life-cycle-of-one-note)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 🔤 [Text tools](#5-text-tools)
 6. 🔵 [Section parser and BHC removal](#6-section-parser-and-bhc-removal)
 7. 🟢 [Patient-level splits](#7-patient-level-splits)
@@ -145,6 +146,39 @@ flowchart LR
 | Prompt | `src/clinical_summarization/prompts/bhc_one_paragraph.txt` | The one-paragraph BHC prompt | Built |
 | Config example | `configs/example.yaml` | The planned format of one experiment | No code reads it yet |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses. A dotted arrow shows that a class implements the `Summarizer` protocol.
+
+```mermaid
+flowchart TB
+    subgraph ENTRY["Entry point"]
+        CLI["cli.py<br/>clinsum prepare"]
+    end
+    subgraph DATA["Data tools, built and tested"]
+        LOAD["data/loaders.py<br/>load_notes, load_targets, build_pairs"]
+        SEC["data/sections.py<br/>find_sections, remove_bhc, extract_bhc"]
+        SPL["data/splits.py<br/>split_of, assign_splits"]
+        TXT["text.py<br/>strip_reasoning, mask_deidentified,<br/>expand_abbreviations"]
+    end
+    subgraph MODELS["Model adapters, written, not tested"]
+        BASE["models/base.py<br/>Summarizer protocol"]
+        HF["models/seq2seq.py<br/>HFSeq2SeqSummarizer"]
+        OL["models/llm.py<br/>OllamaSummarizer, load_prompt"]
+        PR[("prompts/<br/>bhc_one_paragraph.txt")]
+    end
+    MET["eval/metrics.py<br/>align, compute"]
+    CFG[("configs/example.yaml<br/>no code reads it")]
+
+    CLI --> LOAD
+    LOAD --> SEC
+    LOAD --> SPL
+    LOAD --> TXT
+    OL --> TXT
+    OL --> PR
+    MET --> TXT
+    HF -.-> BASE
+    OL -.-> BASE
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -183,6 +217,18 @@ dischargebench/
 ### 3.1 The model input never contains the reference
 The BHC section of the full note is the reference summary. `remove_bhc` removes each BHC section from the input before any model sees it. `build_pairs` records `bhc_removed` for each note, and `clinsum prepare` prints the removal rate.
 
+```mermaid
+flowchart LR
+    NOTE[/"Discharge note text<br/>with a BHC section"/] --> KR{"--keep-reference?"}
+    KR -- "no, default" --> RB["remove_bhc:<br/>cut each BHC section"]
+    KR -- "yes, leakage ablation only" --> KEEP["Keep the full text,<br/>bhc_removed = False"]
+    RB --> IN[/"input_text<br/>model input, no reference"/]
+    KEEP --> LEAK[/"input_text<br/>contains the reference"/]
+    TGT[/"Targets file<br/>target column"/] --> REF[/"target<br/>reference summary"/]
+    RB --> FLAG["bhc_removed = True<br/>for each removal"]
+    FLAG --> RATE[/"clinsum prepare prints<br/>the BHC removal rate"/]
+```
+
 ### 3.2 A problem line does not end the BHC
 A BHC often contains lines such as `Atrial fibrillation: rate controlled`. The parser ends a section only at a known top-level header from a fixed list. Thus the rest of the BHC cannot leak into the input.
 
@@ -211,24 +257,70 @@ The MIMIC data needs a PhysioNet Data Use Agreement. Git ignores `data/*` (excep
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
+flowchart TD
     subgraph BUILT["Built and tested (M0, M1)"]
-        N["Notes file: note_id, subject_id, text"] --> LN["load_notes (unique note_id)"]
-        T["Targets file: note_id, target"] --> LT["load_targets (unique note_id)"]
+        N[/"Notes file: note_id, subject_id, text"/] --> LN["load_notes (unique note_id)"]
+        T[/"Targets file: note_id, target"/] --> LT["load_targets (unique note_id)"]
         LN --> J["Inner join on note_id (one to one)"]
         LT --> J
         J --> R["remove_bhc"] --> MK["mask_deidentified"] --> EX["expand_abbreviations (optional)"]
-        EX --> SP["assign_splits by subject_id"] --> P["Pairs file"]
+        EX --> SP["assign_splits by subject_id"]
+        SP --> EMP{"input_text empty?"}
+        EMP -- "yes" --> DROP["Drop the pair"]
+        EMP -- "no" --> FIL["--split and --limit filters"]
+        FIL --> P[("Pairs file<br/>CSV or Parquet")]
+        FIL --> RATE[/"Printed: number of pairs<br/>and BHC removal rate"/]
+        RATE --> HUMAN{{"HUMAN<br/>examine the headers if the rate is low"}}
     end
     subgraph PLANNED["Written or planned (M2 to M6)"]
         P -.-> S["Summarizer: HFSeq2SeqSummarizer or OllamaSummarizer"]
         S -.-> AL["align by note_id, strip_reasoning"]
         AL -.-> SC["ROUGE, BLEU, BERTScore, factuality checks"]
-        SC -.-> REP["Comparison report"]
+        SC -.-> REP[/"Comparison report"/]
     end
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
 ```
 
 ### 4.2 The life cycle of one note
+
+```mermaid
+stateDiagram-v2
+    state "Raw note row" as Raw
+    state "Joined with its target" as Joined
+    state "No target, dropped" as NoTarget
+    state "BHC removed" as Removed
+    state "BHC kept, ablation" as Kept
+    state "No BHC header found" as NoHeader
+    state "Masked input" as Masked
+    state "Expanded input" as Expanded
+    state "Split assigned" as Split
+    state "Empty input, dropped" as Empty
+    state "Pair in the output file" as Pair
+    state "Prediction, planned" as Predicted
+    state "Scored, planned" as Scored
+    [*] --> Raw: load_notes
+    Raw --> NoTarget: note_id not in the targets file
+    Raw --> Joined: inner join on note_id
+    Joined --> Removed: remove_bhc finds a BHC header
+    Joined --> NoHeader: remove_bhc finds no BHC header
+    Joined --> Kept: --keep-reference
+    Removed --> Masked: mask_deidentified
+    NoHeader --> Masked: mask_deidentified
+    Kept --> Masked: mask_deidentified
+    Masked --> Expanded: --expand-abbreviations
+    Masked --> Split: split_of
+    Expanded --> Split: split_of
+    Split --> Empty: input_text is empty
+    Split --> Pair: written by clinsum prepare
+    Pair --> Predicted: Summarizer.summarize
+    Predicted --> Scored: align, then compute
+    NoTarget --> [*]
+    Empty --> [*]
+    Pair --> [*]
+    Scored --> [*]
+```
 
 1. Put the PhysioNet files in `data/`.
 2. `clinsum prepare` reads the note and its target by `note_id`.
@@ -241,11 +333,70 @@ flowchart TB
 9. The command writes the pair to the output file.
 10. Planned: a summarizer writes a prediction, and the metrics compare it with the target by `note_id`.
 
+### 4.3 Who does which step
+
+The first part is the `clinsum prepare` command. The second part has no command yet (milestone M2). Today a person calls these functions from Python.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor OP as Operator
+    participant CLI as clinsum CLI
+    participant LD as data/loaders.py
+    participant SEC as sections and text
+    participant SPL as data/splits.py
+    participant FS as data/ folder
+    participant OL as OllamaSummarizer
+    participant SRV as Ollama server
+    participant MET as eval/metrics.py
+
+    OP->>CLI: clinsum prepare --notes --targets --out
+    CLI->>LD: load_notes, load_targets
+    LD->>FS: read CSV or Parquet
+    FS-->>LD: notes and targets
+    CLI->>LD: build_pairs(notes, targets, seed)
+    LD->>LD: merge on note_id, one_to_one
+    LD->>SEC: remove_bhc, mask_deidentified, expand_abbreviations
+    SEC-->>LD: input_text and bhc_removed
+    LD->>SPL: assign_splits by subject_id
+    SPL-->>LD: train, val or test
+    LD-->>CLI: pairs without empty inputs
+    CLI->>CLI: filter by --split, then --limit by note_id
+    CLI->>FS: write the pairs file
+    CLI-->>OP: number of pairs and BHC removal rate
+    Note over OP,MET: No command runs the steps below yet (M2)
+    OP->>OL: summarize(input texts)
+    OL->>SRV: POST /api/generate, stream false, temperature, seed
+    SRV-->>OL: response text
+    OL-->>OP: summaries without think blocks
+    OP->>MET: compute(predictions, references, metrics)
+    MET->>MET: align by note_id
+    MET-->>OP: n and one score for each metric
+```
+
 ---
 
 ## 5. Text tools
 
 **Purpose.** Give small, deterministic text functions to the data and evaluation components.
+
+```mermaid
+flowchart LR
+    subgraph PREP["Used by build_pairs"]
+        N[/"Note text"/] --> MK["mask_deidentified:<br/>3 or more _ to [REDACTED]"]
+        MK --> EXQ{"expand_abbrev?"}
+        EXQ -- "yes" --> EX["expand_abbreviations:<br/>longest key first,<br/>standalone tokens only"]
+        EXQ -- "no" --> IN[/"input_text"/]
+        EX --> IN
+        MAP[("DEFAULT_ABBREVIATIONS<br/>13 entries")] --> EX
+    end
+    subgraph SCORE["Used by align and OllamaSummarizer"]
+        O[/"Model output"/] --> TB["Remove closed think blocks"]
+        TB --> TU["Remove an unclosed<br/>trailing think block"]
+        TU --> NW["normalize_whitespace:<br/>one space for each run"]
+        NW --> CL[/"Clean summary"/]
+    end
+```
 
 | Function | Input | Output |
 |---|---|---|
@@ -266,6 +417,21 @@ flowchart TB
 ## 6. Section parser and BHC removal
 
 **Purpose.** Find the known sections of a discharge note and remove the reference summary from the input.
+
+```mermaid
+flowchart TD
+    IN[/"Note text"/] --> E{"Text empty?"}
+    E -- "yes" --> OUT0[/"Text unchanged, False"/]
+    E -- "no" --> FS["find_sections: match a known header<br/>and a colon at a line start, any case"]
+    HDR[("KNOWN_HEADERS<br/>18 standard + 2 BHC headers")] --> FS
+    FS --> SEC["Each section ends where the<br/>next known header starts"]
+    SEC --> B{"Any section named Brief Hospital Course<br/>or Hospital Course?"}
+    B -- "no" --> OUT0
+    B -- "yes" --> CUT["remove_bhc: cut each BHC span,<br/>join the other parts"]
+    CUT --> OUT1[/"Text without the BHC, True"/]
+    SEC --> X["extract_bhc: first BHC section,<br/>text after the first colon"]
+    X --> OUT2[/"BHC body, or None"/]
+```
 
 | Input | Output |
 |---|---|
@@ -291,6 +457,25 @@ flowchart TB
 
 **Purpose.** Give each patient one split, the same on each machine and in each run.
 
+```mermaid
+flowchart TD
+    DF[/"Pairs table"/] --> COL{"subject_id column<br/>present?"}
+    COL -- "no" --> KE[/"KeyError"/]
+    COL -- "yes" --> EACH["split_of for each row:<br/>subject_id, seed, ratios"]
+    EACH --> R{"Ratios add up to 1?"}
+    R -- "no" --> VE[/"ValueError"/]
+    R -- "yes" --> FL{"Float with an<br/>integer value?"}
+    FL -- "yes" --> INT["Change to int:<br/>10001.0 to 10001"]
+    FL -- "no" --> H["SHA-256 of seed:subject_id"]
+    INT --> H
+    H --> U["u = first 8 bytes / 2^64"]
+    U --> C1{"u below 0.8?"}
+    C1 -- "yes" --> TR[/"train"/]
+    C1 -- "no" --> C2{"u below 0.9?"}
+    C2 -- "yes" --> VA[/"val"/]
+    C2 -- "no" --> TE[/"test"/]
+```
+
 | Input | Output |
 |---|---|
 | A `subject_id`, a seed (default 42) and ratios (default 0.8, 0.1, 0.1) | `train`, `val` or `test` |
@@ -314,13 +499,38 @@ flowchart TB
 
 **Purpose.** Make the `note_id`-aligned (input, target) pairs that all models will use.
 
+```mermaid
+flowchart TD
+    NF[/"--notes file"/] --> RD["_read: CSV or Parquet,<br/>keep the necessary columns"]
+    TF[/"--targets file"/] --> RD
+    RD --> MC{"Column absent?"}
+    MC -- "yes" --> KE[/"KeyError"/]
+    MC -- "no" --> DUP{"Duplicate note_id?"}
+    DUP -- "yes" --> VE[/"ValueError"/]
+    DUP -- "no" --> BP["build_pairs: inner join on note_id,<br/>validate one_to_one"]
+    BP --> PI["Prepare each input:<br/>remove_bhc, mask, optional expansion"]
+    PI --> AS["assign_splits(seed)"]
+    AS --> DE["Drop rows with an empty input_text"]
+    DE --> SPQ{"--split is all?"}
+    SPQ -- "no" --> KS["Keep the requested split"]
+    SPQ -- "yes" --> LIM{"--limit set?"}
+    KS --> LIM
+    LIM -- "yes" --> SORT["Sort by note_id,<br/>keep the first N"]
+    LIM -- "no" --> SUF{"--out suffix .parquet?"}
+    SORT --> SUF
+    SUF -- "yes" --> PQ[("Parquet file")]
+    SUF -- "no" --> CSV[("CSV file")]
+    PQ --> MSG[/"wrote N pairs, BHC removal rate"/]
+    CSV --> MSG
+```
+
 | Input | Output |
 |---|---|
 | A notes file (`note_id`, `subject_id`, `text`) and a targets file (`note_id`, `target`), CSV or Parquet | A CSV or Parquet file with `note_id`, `subject_id`, `split`, `input_text`, `target`, `bhc_removed` |
 
 **Procedure**
 
-1. `load_notes` and `load_targets` read only the necessary columns. An absent column raises `KeyError`.
+1. `load_notes` and `load_targets` keep only the necessary columns. A CSV file is read with these columns only. A Parquet file is read in full. An absent column raises `KeyError`.
 2. A duplicate `note_id` in either file raises `ValueError`.
 3. `build_pairs` joins on `note_id`, prepares each input (sections 4.2 and 6) and assigns the splits.
 4. `clinsum prepare` keeps only the requested split (`--split`, default `all`).
@@ -356,6 +566,25 @@ flowchart TB
 
 **Procedure (`HFSeq2SeqSummarizer`)**
 
+```mermaid
+flowchart TD
+    INIT[/"model_name, long_input"/] --> LI{"long_input is<br/>truncate or chunk?"}
+    LI -- "no" --> VE[/"ValueError"/]
+    LI -- "yes" --> LD["Load AutoTokenizer and<br/>AutoModelForSeq2SeqLM, cuda or cpu"]
+    LD --> T[/"One input text"/]
+    T --> CNT["Count the tokens"]
+    CNT --> FIT{"Tokens ≤ max_input_tokens − 32?"}
+    FIT -- "yes" --> GEN["_generate: beam search,<br/>num_beams, max_new_tokens"]
+    FIT -- "no" --> INC["truncated += 1"]
+    INC --> MODE{"long_input"}
+    MODE -- "truncate" --> GEN
+    MODE -- "chunk" --> CH["_chunks: overlapping token windows,<br/>chunk_overlap 64"]
+    CH --> MAP["Map: _generate for each chunk"]
+    MAP --> RED["Reduce: _generate on the<br/>joined chunk summaries"]
+    GEN --> OUT[/"Summary, same order as the inputs"/]
+    RED --> OUT
+```
+
 1. Count the tokens of the input.
 2. If the input fits in `max_input_tokens − 32`, generate the summary with beam search.
 3. If the input is longer, add 1 to `truncated`.
@@ -364,6 +593,26 @@ flowchart TB
 6. Join the chunk summaries and summarize them again (reduce).
 
 **Procedure (`OllamaSummarizer`)**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Caller
+    participant OS as OllamaSummarizer
+    participant PR as prompts folder
+    participant SRV as Ollama server
+
+    C->>OS: OllamaSummarizer(model, prompt, temperature 0, seed 42)
+    OS->>PR: load_prompt, read bhc_one_paragraph.txt
+    PR-->>OS: template with a note field
+    C->>OS: summarize(texts)
+    loop For each input text
+        OS->>SRV: POST host/api/generate, stream false, options temperature and seed
+        SRV-->>OS: JSON with response
+        OS->>OS: raise_for_status, then strip_reasoning
+    end
+    OS-->>C: one summary for each input, same order
+```
 
 1. Load the prompt template from `prompts/<name>.txt`.
 2. Send `POST <host>/api/generate` with `stream=false`, the temperature and the seed.
@@ -379,6 +628,24 @@ flowchart TB
 ## 10. Evaluation metrics
 
 **Purpose.** Compare predictions with references of the same note.
+
+```mermaid
+flowchart TD
+    P[/"predictions: note_id to text"/] --> M{"Prediction without<br/>a reference?"}
+    R[/"references: note_id to text"/] --> M
+    M -- "yes" --> VE1[/"ValueError"/]
+    M -- "no" --> S{"ID sets differ and<br/>allow_subset is False?"}
+    S -- "yes" --> VE2[/"ValueError"/]
+    S -- "no" --> AL["align: sort the predicted IDs,<br/>strip_reasoning on each prediction"]
+    AL --> LOOP{"Metric name"}
+    LOOP -- "rouge" --> RG["evaluate rouge,<br/>use_stemmer"]
+    LOOP -- "bleu" --> BL["evaluate bleu,<br/>one reference each"]
+    LOOP -- "bertscore" --> BS["evaluate bertscore, lang en,<br/>mean precision, recall, F1"]
+    LOOP -- "other" --> VE3[/"ValueError"/]
+    RG --> OUT[/"Dict: n and one entry<br/>for each metric"/]
+    BL --> OUT
+    BS --> OUT
+```
 
 | Input | Output |
 |---|---|
@@ -413,6 +680,21 @@ flowchart TB
 | Long notes are truncated in silence | `truncated` counter and map-reduce chunks | Written, not tested, counter not reported |
 | LLM runs are not reproducible | Temperature 0, seed, versioned prompt | Written. Saving the config with each run is planned |
 | ROUGE does not see dangerous errors | Factuality checks and a human-review rubric | Planned (M5) |
+
+The diagram shows the milestones in sequence. Solid boxes are done. Dotted arrows lead to planned milestones.
+
+```mermaid
+flowchart LR
+    M0["M0 done<br/>skeleton, license, CI"] --> M1["M1 done<br/>BHC removal, note_id join,<br/>patient splits, tests"]
+    M1 -.-> M2["M2 planned<br/>zero-shot BART, PEGASUS,<br/>T5, LongT5"]
+    M2 -.-> M3["M3 planned<br/>LLM runs, adapter written"]
+    M3 -.-> M4["M4 planned<br/>LoRA fine-tune"]
+    M4 -.-> M5["M5 planned<br/>factuality checks,<br/>human-review rubric"]
+    M5 -.-> M6["M6 planned<br/>tracking and<br/>comparison report"]
+
+    classDef done fill:#d4edda,stroke:#2e7d32,color:#1b3d1f
+    class M0,M1 done
+```
 
 | Milestone | Content | State |
 |---|---|---|
@@ -482,6 +764,24 @@ wrote 6 pairs to out/pairs.csv  (BHC section removed from 83.3% of inputs)
 ```
 
 If the removal rate is low on real notes, examine the headers before you use the pairs.
+
+The diagram shows the order of the commands and the files that connect them.
+
+```mermaid
+flowchart LR
+    INS["pip install -e .[dev]"] --> TST["pytest -q<br/>12 tests, no data"]
+    PN[/"PhysioNet files<br/>in data/"/] --> PREP["clinsum prepare<br/>--split test --limit 1000"]
+    INS --> PREP
+    PREP --> PAIRS[("data/test_pairs.csv")]
+    PREP --> RATE{"BHC removal rate<br/>near 100 %?"}
+    RATE -- "yes" --> USE["Use the pairs"]
+    RATE -- "no" --> HUMAN{{"HUMAN<br/>examine the headers,<br/>add to KNOWN_HEADERS"}}
+    PN --> ABL["clinsum prepare<br/>--keep-reference"]
+    ABL --> LEAK[("data/leak_ablation.csv<br/>ablation only")]
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
+```
 
 ### 13.4 Environment variables
 
